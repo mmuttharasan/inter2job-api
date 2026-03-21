@@ -10,6 +10,8 @@ from .internships import internships_bp
 from .certificates import certificates_bp
 from .messages import messages_bp
 from .evaluation import evaluation_bp
+from .notifications import notifications_bp
+from .jd_workflow import jd_workflow_bp
 
 
 def register_routes(app):
@@ -18,6 +20,7 @@ def register_routes(app):
     app.register_blueprint(internships_bp, url_prefix="/api/students")
     app.register_blueprint(companies_bp, url_prefix="/api/companies")
     app.register_blueprint(universities_bp, url_prefix="/api/universities")
+    app.register_blueprint(jd_workflow_bp, url_prefix="/api/universities")
     app.register_blueprint(jobs_bp, url_prefix="/api/jobs")
     app.register_blueprint(matching_bp, url_prefix="/api/matching")
     app.register_blueprint(analytics_bp, url_prefix="/api/analytics")
@@ -26,3 +29,4 @@ def register_routes(app):
     app.register_blueprint(certificates_bp, url_prefix="/api/certificates")
     app.register_blueprint(messages_bp, url_prefix="/api/messages")
     app.register_blueprint(evaluation_bp, url_prefix="/api/evaluation")
+    app.register_blueprint(notifications_bp, url_prefix="/api/notifications")

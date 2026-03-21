@@ -39,6 +39,22 @@ VALID_STATUS_TRANSITIONS = {
     "archived":  [],
 }
 
+# Lifecycle stage machine — the new governed workflow
+VALID_LIFECYCLE_TRANSITIONS = {
+    "draft":                    ["pending_approval"],
+    "pending_approval":         ["draft", "approved_assigning"],       # reject → draft, approve → assigning
+    "approved_assigning":       ["university_assigned"],
+    "university_assigned":      ["collecting_applications"],
+    "collecting_applications":  ["under_curation"],
+    "under_curation":           ["forwarded_to_company"],
+    "forwarded_to_company":     ["interview_scheduling"],
+    "interview_scheduling":     ["interviewing"],
+    "interviewing":             ["results_pending"],
+    "results_pending":          ["offer_stage"],
+    "offer_stage":              ["completed"],
+    "completed":                [],
+}
+
 # application_status valid transitions
 VALID_APP_TRANSITIONS = {
     "pending":    ["shortlisted", "rejected"],
@@ -130,6 +146,8 @@ def _format_job_list(raw: dict) -> dict:
         "department": raw.get("department"),
         "location": raw.get("location"),
         "status": raw.get("status"),
+        "lifecycle_stage": raw.get("lifecycle_stage", "draft"),
+        "approval_status": raw.get("approval_status", "not_submitted"),
         "priority": raw.get("priority", "medium"),
         "deadline": raw.get("deadline"),
         "applications_count": raw.get("applications_count", 0),
@@ -1240,3 +1258,570 @@ def compare_candidates(job_id):
         })
 
     return jsonify({"data": {"candidates": candidates}})
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs/<job_id>/submit-for-approval
+# ---------------------------------------------------------------------------
+
+@jobs_bp.post("/<string:job_id>/submit-for-approval")
+@require_role(["company_admin", "recruiter"])
+def submit_for_approval(job_id):
+    """Company admin submits a draft JD for platform admin review."""
+    from ..services.notification_service import notify_admins
+
+    company_id, err = _get_company_id(g.user_id)
+    if err:
+        return err
+
+    try:
+        existing = (
+            supabase.table("jobs")
+            .select("id, company_id, status, lifecycle_stage, title")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    if not existing.data:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    ownership_err = _assert_job_ownership(existing.data, company_id)
+    if ownership_err:
+        return ownership_err
+
+    current_stage = existing.data.get("lifecycle_stage", "draft")
+    if current_stage != "draft":
+        return _err(
+            "INVALID_TRANSITION",
+            f"Can only submit for approval from 'draft' stage, currently '{current_stage}'",
+            422,
+        )
+
+    try:
+        supabase.table("jobs").update({
+            "lifecycle_stage": "pending_approval",
+            "approval_status": "pending",
+            "submitted_for_approval_at": datetime.utcnow().isoformat(),
+        }).eq("id", job_id).execute()
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to submit for approval", 500)
+
+    # Notify platform admins
+    title = existing.data.get("title", "Untitled Job")
+    notify_admins(
+        "jd_submitted_for_approval",
+        "New JD submitted for approval",
+        f"'{title}' has been submitted for review.",
+        "job", job_id,
+    )
+
+    return jsonify({
+        "data": {
+            "id": job_id,
+            "lifecycle_stage": "pending_approval",
+            "approval_status": "pending",
+        }
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /api/jobs/<job_id>/curated-candidates
+# ---------------------------------------------------------------------------
+
+@jobs_bp.get("/<string:job_id>/curated-candidates")
+@require_role(["company_admin", "recruiter"])
+def get_curated_candidates(job_id):
+    """Get candidates forwarded by the platform admin."""
+    company_id, err = _get_company_id(g.user_id)
+    if err:
+        return err
+
+    try:
+        job_res = (
+            supabase.table("jobs")
+            .select("id, company_id")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    if not job_res.data:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    ownership_err = _assert_job_ownership(job_res.data, company_id)
+    if ownership_err:
+        return ownership_err
+
+    # Get forwarded curation entries
+    try:
+        curation_res = (
+            supabase.table("admin_application_curation")
+            .select("application_id, curation_note, forwarded_at")
+            .eq("job_id", job_id)
+            .eq("curation_status", "included")
+            .not_.is_("forwarded_at", "null")
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch curated candidates", 500)
+
+    curated = curation_res.data or []
+    if not curated:
+        return jsonify({"data": [], "meta": {"total": 0}})
+
+    app_ids = [c["application_id"] for c in curated]
+    curation_map = {c["application_id"]: c for c in curated}
+
+    # Fetch applications
+    try:
+        apps_res = (
+            supabase.table("applications")
+            .select("id, student_id, status, ai_score, cover_letter, created_at")
+            .in_("id", app_ids)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch applications", 500)
+
+    apps = apps_res.data or []
+    student_ids = list({a["student_id"] for a in apps if a.get("student_id")})
+
+    # Fetch student details (students + profiles + universities) separately
+    students_map = {}
+    profiles_map = {}
+    universities_map = {}
+
+    if student_ids:
+        try:
+            stu_res = (
+                supabase.table("students")
+                .select("id, department, gpa, graduation_year, skills, university_id")
+                .in_("id", student_ids)
+                .execute()
+            )
+            for s in (stu_res.data or []):
+                students_map[s["id"]] = s
+        except Exception:
+            pass
+
+        try:
+            prof_res = (
+                supabase.table("profiles")
+                .select("id, full_name, avatar_url, university_id")
+                .in_("id", student_ids)
+                .execute()
+            )
+            for p in (prof_res.data or []):
+                profiles_map[p["id"]] = p
+        except Exception:
+            pass
+
+        uni_ids = list({s.get("university_id") for s in students_map.values() if s.get("university_id")})
+        if uni_ids:
+            try:
+                uni_res = (
+                    supabase.table("universities")
+                    .select("id, name, location")
+                    .in_("id", uni_ids)
+                    .execute()
+                )
+                for u in (uni_res.data or []):
+                    universities_map[u["id"]] = u
+            except Exception:
+                pass
+
+    formatted = []
+    for app in apps:
+        sid = app.get("student_id")
+        stu = students_map.get(sid, {})
+        prof = profiles_map.get(sid, {})
+        uni = universities_map.get(stu.get("university_id", ""), {})
+        cur = curation_map.get(app["id"], {})
+        formatted.append({
+            "application_id": app["id"],
+            "student_id": sid,
+            "student_name": prof.get("full_name"),
+            "student_avatar_url": prof.get("avatar_url"),
+            "student_school": uni.get("name"),
+            "student_school_location": uni.get("location"),
+            "student_department": stu.get("department"),
+            "student_gpa": stu.get("gpa"),
+            "student_graduation_year": stu.get("graduation_year"),
+            "skills": stu.get("skills") or [],
+            "ai_score": app.get("ai_score"),
+            "cover_letter": app.get("cover_letter"),
+            "status": app.get("status"),
+            "curation_note": cur.get("curation_note"),
+            "forwarded_at": cur.get("forwarded_at"),
+            "applied_at": app.get("created_at"),
+        })
+
+    return jsonify({"data": formatted, "meta": {"total": len(formatted)}})
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs/<job_id>/interview-slots
+# ---------------------------------------------------------------------------
+
+@jobs_bp.post("/<string:job_id>/interview-slots")
+@require_role(["company_admin", "recruiter"])
+def submit_interview_slots(job_id):
+    """Company admin submits proposed interview time slots."""
+    from ..services.notification_service import notify_admins
+
+    company_id, err = _get_company_id(g.user_id)
+    if err:
+        return err
+
+    try:
+        existing = (
+            supabase.table("jobs")
+            .select("id, company_id, lifecycle_stage, title")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    if not existing.data:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    ownership_err = _assert_job_ownership(existing.data, company_id)
+    if ownership_err:
+        return ownership_err
+
+    current_stage = existing.data.get("lifecycle_stage")
+    if current_stage != "forwarded_to_company":
+        return _err(
+            "INVALID_TRANSITION",
+            f"Interview slots can only be submitted at 'forwarded_to_company' stage, currently '{current_stage}'",
+            422,
+        )
+
+    payload = request.get_json(silent=True) or {}
+    slots = payload.get("slots", [])
+    note = payload.get("note", "")
+
+    if not slots or not isinstance(slots, list):
+        return _err("VALIDATION_ERROR", "'slots' must be a non-empty array", 400)
+
+    # Create interview round
+    try:
+        round_res = supabase.table("interview_rounds").insert({
+            "job_id": job_id,
+            "proposed_slots": slots,
+            "company_slot_note": note,
+            "status": "slots_submitted",
+        }).execute()
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to create interview round", 500)
+
+    # Advance lifecycle
+    try:
+        supabase.table("jobs").update({
+            "lifecycle_stage": "interview_scheduling",
+        }).eq("id", job_id).execute()
+    except Exception:
+        pass
+
+    notify_admins(
+        "interview_slots_submitted",
+        "Interview slots submitted",
+        f"Company has submitted interview slots for '{existing.data.get('title')}'.",
+        "job", job_id,
+    )
+
+    return jsonify({
+        "data": round_res.data[0] if round_res.data else {},
+        "lifecycle_stage": "interview_scheduling",
+    }), 201
+
+
+# ---------------------------------------------------------------------------
+# GET /api/jobs/<job_id>/interview-slots
+# ---------------------------------------------------------------------------
+
+@jobs_bp.get("/<string:job_id>/interview-slots")
+@require_role(["company_admin", "recruiter"])
+def get_interview_slots(job_id):
+    """Get interview rounds and schedules for a job."""
+    company_id, err = _get_company_id(g.user_id)
+    if err:
+        return err
+
+    try:
+        job_res = (
+            supabase.table("jobs")
+            .select("id, company_id")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    if not job_res.data:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    ownership_err = _assert_job_ownership(job_res.data, company_id)
+    if ownership_err:
+        return ownership_err
+
+    try:
+        rounds_res = (
+            supabase.table("interview_rounds")
+            .select("*")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch interview rounds", 500)
+
+    rounds = rounds_res.data or []
+    round_ids = [r["id"] for r in rounds]
+
+    schedules = []
+    if round_ids:
+        try:
+            sched_res = (
+                supabase.table("interview_schedules")
+                .select("*, students(profiles(full_name))")
+                .in_("round_id", round_ids)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            schedules = sched_res.data or []
+        except Exception:
+            try:
+                sched_res = (
+                    supabase.table("interview_schedules")
+                    .select("*")
+                    .in_("round_id", round_ids)
+                    .execute()
+                )
+                schedules = sched_res.data or []
+            except Exception:
+                pass
+
+    return jsonify({"data": {"rounds": rounds, "schedules": schedules}})
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs/<job_id>/interview-results
+# ---------------------------------------------------------------------------
+
+@jobs_bp.post("/<string:job_id>/interview-results")
+@require_role(["company_admin", "recruiter"])
+def submit_interview_results(job_id):
+    """Company admin submits interview results and offer decisions."""
+    from ..services.notification_service import notify_admins
+
+    company_id, err = _get_company_id(g.user_id)
+    if err:
+        return err
+
+    try:
+        existing = (
+            supabase.table("jobs")
+            .select("id, company_id, lifecycle_stage, title")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    if not existing.data:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    ownership_err = _assert_job_ownership(existing.data, company_id)
+    if ownership_err:
+        return ownership_err
+
+    current_stage = existing.data.get("lifecycle_stage")
+    if current_stage != "results_pending":
+        return _err(
+            "INVALID_TRANSITION",
+            f"Results can only be submitted at 'results_pending' stage, currently '{current_stage}'",
+            422,
+        )
+
+    payload = request.get_json(silent=True) or {}
+    results = payload.get("results", [])
+    if not results or not isinstance(results, list):
+        return _err("VALIDATION_ERROR", "'results' must be a non-empty array", 400)
+
+    # Update interview schedules and create offers for accepted
+    created_offers = []
+    for r in results:
+        schedule_id = r.get("schedule_id")
+        result = r.get("result", "pending")
+        offer_decision = r.get("offer_decision")
+        note = r.get("note", "")
+
+        if schedule_id:
+            try:
+                supabase.table("interview_schedules").update({
+                    "result": result,
+                    "result_note": note,
+                    "offer_decision": offer_decision,
+                    "result_submitted_at": datetime.utcnow().isoformat(),
+                }).eq("id", schedule_id).execute()
+            except Exception:
+                pass
+
+        # Create offer if decision is "offer"
+        if offer_decision == "offer":
+            app_id = r.get("application_id")
+            student_id = r.get("student_id")
+            if app_id and student_id:
+                try:
+                    offer_res = supabase.table("offers").insert({
+                        "job_id": job_id,
+                        "application_id": app_id,
+                        "student_id": student_id,
+                        "company_id": company_id,
+                        "offer_details": r.get("offer_details", {}),
+                        "status": "pending",
+                        "response_deadline": r.get("response_deadline"),
+                    }).execute()
+                    if offer_res.data:
+                        created_offers.append(offer_res.data[0])
+                except Exception:
+                    pass
+
+    # Update interview round status
+    try:
+        rounds_res = (
+            supabase.table("interview_rounds")
+            .select("id")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if rounds_res.data:
+            supabase.table("interview_rounds").update({
+                "status": "results_submitted",
+                "results_submitted_at": datetime.utcnow().isoformat(),
+            }).eq("id", rounds_res.data[0]["id"]).execute()
+    except Exception:
+        pass
+
+    # Advance lifecycle
+    try:
+        supabase.table("jobs").update({
+            "lifecycle_stage": "offer_stage",
+        }).eq("id", job_id).execute()
+    except Exception:
+        pass
+
+    notify_admins(
+        "interview_results_submitted",
+        "Interview results submitted",
+        f"Company has submitted interview results for '{existing.data.get('title')}'.",
+        "job", job_id,
+    )
+
+    return jsonify({
+        "data": {"offers_created": len(created_offers), "offers": created_offers},
+        "lifecycle_stage": "offer_stage",
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs/<job_id>/internship-conclusion
+# ---------------------------------------------------------------------------
+
+@jobs_bp.post("/<string:job_id>/internship-conclusion")
+@require_role(["company_admin", "recruiter"])
+def conclude_internship(job_id):
+    """Company admin concludes an internship: convert, extend, or complete with cert."""
+    from ..services.notification_service import notify, notify_admins
+
+    company_id, err = _get_company_id(g.user_id)
+    if err:
+        return err
+
+    payload = request.get_json(silent=True) or {}
+    internship_id = payload.get("internship_id")
+    conclusion_type = payload.get("conclusion_type")
+    note = payload.get("note", "")
+    extension_end_date = payload.get("extension_end_date")
+
+    if not internship_id:
+        return _err("VALIDATION_ERROR", "'internship_id' is required", 400)
+    if conclusion_type not in ("converted_to_employee", "extended", "completed_with_certificate"):
+        return _err("VALIDATION_ERROR", "Invalid conclusion_type", 400)
+
+    # Verify internship belongs to this company
+    try:
+        intern_res = (
+            supabase.table("internships")
+            .select("id, company_id, student_id, job_id, status")
+            .eq("id", internship_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Internship not found", 404)
+
+    if not intern_res.data:
+        return _err("NOT_FOUND", "Internship not found", 404)
+
+    if intern_res.data.get("company_id") != company_id:
+        return _err("FORBIDDEN", "Not authorized for this internship", 403)
+
+    update_data = {
+        "conclusion_type": conclusion_type,
+        "conclusion_note": note,
+        "concluded_at": datetime.utcnow().isoformat(),
+        "concluded_by": g.user_id,
+    }
+
+    if conclusion_type == "extended":
+        if not extension_end_date:
+            return _err("VALIDATION_ERROR", "'extension_end_date' is required for extension", 400)
+        update_data["extension_end_date"] = extension_end_date
+        # keep status as in_progress
+    elif conclusion_type == "completed_with_certificate":
+        update_data["status"] = "completed"
+    elif conclusion_type == "converted_to_employee":
+        update_data["status"] = "completed"
+
+    try:
+        res = (
+            supabase.table("internships")
+            .update(update_data)
+            .eq("id", internship_id)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to update internship", 500)
+
+    # Notify student
+    student_id = intern_res.data.get("student_id")
+    if student_id:
+        msg_map = {
+            "converted_to_employee": "Your internship has been converted to full-time employment!",
+            "extended": f"Your internship has been extended until {extension_end_date}.",
+            "completed_with_certificate": "Your internship is complete. A certificate will be issued.",
+        }
+        notify(student_id, "internship_concluded", "Internship Update", msg_map.get(conclusion_type, ""),
+               "internship", internship_id)
+
+    notify_admins(
+        "internship_concluded",
+        "Internship concluded",
+        f"Internship concluded as '{conclusion_type}'.",
+        "internship", internship_id,
+    )
+
+    return jsonify({"data": res.data[0] if res.data else {}})

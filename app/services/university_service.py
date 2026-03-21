@@ -236,7 +236,7 @@ def create_student(university_id: str, actor_id: str, data: dict) -> dict:
         err = str(e).lower()
         if "already" in err or "exists" in err or "duplicate" in err:
             raise ValueError("EMAIL_EXISTS")
-        raise ValueError("CREATE_FAILED")
+        raise ValueError(f"CREATE_FAILED:{e}")
 
     # 2. Upsert profile
     supabase.table("profiles").upsert({

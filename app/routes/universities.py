@@ -160,7 +160,9 @@ def create_one_student():
             return _err(code, "Email is already registered", 409)
         if code == "MISSING_FIELDS":
             return _err(code, "full_name and email are required", 400)
-        return _err("CREATE_FAILED", code, 400)
+        # code may be "CREATE_FAILED:actual supabase error"
+        detail = code.split(":", 1)[1].strip() if ":" in code else code
+        return _err("CREATE_FAILED", f"Failed to create student: {detail}", 400)
 
 
 @universities_bp.post("/me/students/bulk")

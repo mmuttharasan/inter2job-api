@@ -539,3 +539,374 @@ def get_student(student_id: str):
             "profile_completeness": float(student.get("profile_completeness") or 0),
         }
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# JD Lifecycle — Student job discovery & offer management
+# ═══════════════════════════════════════════════════════════════════════════
+
+from datetime import datetime
+from ..services.notification_service import notify, notify_admins
+
+
+# ---------------------------------------------------------------------------
+# GET /api/students/available-jobs
+# ---------------------------------------------------------------------------
+
+@students_bp.get("/available-jobs")
+@require_auth
+def available_jobs():
+    """Jobs available to the student via university assignment."""
+    page = max(1, int(request.args.get("page", 1)))
+    limit = min(100, max(1, int(request.args.get("limit", 20))))
+
+    # Get student's university
+    uni_id = None
+    try:
+        profile_res = (
+            supabase.table("profiles")
+            .select("university_id")
+            .eq("id", g.user_id)
+            .single()
+            .execute()
+        )
+        uni_id = profile_res.data.get("university_id") if profile_res.data else None
+    except Exception:
+        pass
+
+    if not uni_id:
+        return jsonify({"data": [], "meta": {"total": 0, "page": page, "limit": limit, "pages": 0}})
+
+    # Find jobs assigned to this university
+    try:
+        assign_res = (
+            supabase.table("job_university_assignments")
+            .select("job_id, student_ids")
+            .eq("university_id", uni_id)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch available jobs", 500)
+
+    assignments = assign_res.data or []
+    if not assignments:
+        return jsonify({"data": [], "meta": {"total": 0, "page": page, "limit": limit, "pages": 0}})
+
+    job_ids = [a["job_id"] for a in assignments]
+    # Track if student was specifically notified
+    notified_job_ids = set()
+    for a in assignments:
+        if g.user_id in (a.get("student_ids") or []):
+            notified_job_ids.add(a["job_id"])
+
+    # Fetch jobs that are open for applications
+    try:
+        jobs_res = (
+            supabase.table("jobs")
+            .select("id, title, department, location, description, skills, "
+                    "salary_min, salary_max, deadline, employment_type, is_remote, "
+                    "openings, company_id, created_at, lifecycle_stage")
+            .in_("id", job_ids)
+            .in_("lifecycle_stage", ["university_assigned", "collecting_applications"])
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch jobs", 500)
+
+    rows = jobs_res.data or []
+
+    # Attach company info
+    company_ids = list({r.get("company_id") for r in rows if r.get("company_id")})
+    companies_map = {}
+    if company_ids:
+        try:
+            comp_res = (
+                supabase.table("companies")
+                .select("id, name, logo_url, industry, location")
+                .in_("id", company_ids)
+                .execute()
+            )
+            for c in (comp_res.data or []):
+                companies_map[c["id"]] = c
+        except Exception:
+            pass
+
+    # Check which jobs the student has already applied to
+    already_applied = set()
+    try:
+        app_res = (
+            supabase.table("applications")
+            .select("job_id")
+            .eq("student_id", g.user_id)
+            .in_("job_id", job_ids)
+            .execute()
+        )
+        already_applied = {a["job_id"] for a in (app_res.data or [])}
+    except Exception:
+        pass
+
+    total = len(rows)
+    page_rows = rows[(page - 1) * limit : page * limit]
+
+    data = []
+    for r in page_rows:
+        company = companies_map.get(r.get("company_id"), {})
+        data.append({
+            "id": r["id"],
+            "title": r.get("title"),
+            "department": r.get("department"),
+            "location": r.get("location") or company.get("location"),
+            "description": (r.get("description") or "")[:200],
+            "skills": r.get("skills") or [],
+            "salary_min": r.get("salary_min"),
+            "salary_max": r.get("salary_max"),
+            "deadline": r.get("deadline"),
+            "employment_type": r.get("employment_type"),
+            "is_remote": r.get("is_remote", False),
+            "openings": r.get("openings", 1),
+            "company_id": r.get("company_id"),
+            "company_name": company.get("name"),
+            "company_logo_url": company.get("logo_url"),
+            "company_industry": company.get("industry"),
+            "created_at": r.get("created_at"),
+            "lifecycle_stage": r.get("lifecycle_stage"),
+            "is_notified": r["id"] in notified_job_ids,
+            "has_applied": r["id"] in already_applied,
+        })
+
+    return jsonify({
+        "data": data,
+        "meta": {"total": total, "page": page, "limit": limit,
+                 "pages": (total + limit - 1) // limit if limit else 1},
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/students/jobs/<job_id>/apply
+# ---------------------------------------------------------------------------
+
+@students_bp.post("/jobs/<string:job_id>/apply")
+@require_auth
+def apply_to_job(job_id):
+    """Student applies to a job."""
+    payload = request.get_json(silent=True) or {}
+    cover_letter = payload.get("cover_letter", "")
+
+    # Verify job exists and is open
+    try:
+        job_res = (
+            supabase.table("jobs")
+            .select("id, lifecycle_stage, title")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    if not job_res.data:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    stage = job_res.data.get("lifecycle_stage")
+    if stage not in ("university_assigned", "collecting_applications", "under_curation"):
+        return _err("VALIDATION_ERROR", "This job is not currently accepting applications", 400)
+
+    # Check for duplicate application
+    try:
+        dup_res = (
+            supabase.table("applications")
+            .select("id")
+            .eq("job_id", job_id)
+            .eq("student_id", g.user_id)
+            .maybe_single()
+            .execute()
+        )
+        if dup_res.data:
+            return _err("CONFLICT", "You have already applied to this job", 409)
+    except Exception:
+        pass
+
+    # Create application
+    try:
+        app_res = supabase.table("applications").insert({
+            "job_id": job_id,
+            "student_id": g.user_id,
+            "status": "pending",
+            "cover_letter": cover_letter,
+        }).execute()
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to submit application", 500)
+
+    if not app_res.data:
+        return _err("SERVER_ERROR", "Failed to submit application", 500)
+
+    # Transition lifecycle stage to collecting_applications if still university_assigned
+    if stage == "university_assigned":
+        try:
+            supabase.table("jobs").update({
+                "lifecycle_stage": "collecting_applications",
+            }).eq("id", job_id).execute()
+        except Exception:
+            pass  # non-critical — don't block the application
+
+    # Notify platform admins
+    notify_admins(
+        "student_applied",
+        "New application received",
+        f"A student has applied to '{job_res.data.get('title')}'.",
+        "job", job_id,
+    )
+
+    return jsonify({"data": app_res.data[0]}), 201
+
+
+# ---------------------------------------------------------------------------
+# GET /api/students/my-offers
+# ---------------------------------------------------------------------------
+
+@students_bp.get("/my-offers")
+@require_auth
+def get_my_offers():
+    """Get all offers for the authenticated student."""
+    try:
+        res = (
+            supabase.table("offers")
+            .select("*, jobs(title, company_id, companies(name, logo_url))")
+            .eq("student_id", g.user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        try:
+            res = (
+                supabase.table("offers")
+                .select("*")
+                .eq("student_id", g.user_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+        except Exception:
+            return _err("SERVER_ERROR", "Failed to fetch offers", 500)
+
+    offers = res.data or []
+    formatted = []
+    for o in offers:
+        job_data = o.get("jobs") or {}
+        company_data = job_data.get("companies") or {}
+        formatted.append({
+            "id": o["id"],
+            "job_id": o.get("job_id"),
+            "job_title": job_data.get("title"),
+            "company_name": company_data.get("name"),
+            "company_logo_url": company_data.get("logo_url"),
+            "offer_details": o.get("offer_details", {}),
+            "status": o.get("status"),
+            "sent_at": o.get("sent_at"),
+            "response_deadline": o.get("response_deadline"),
+            "responded_at": o.get("responded_at"),
+            "created_at": o.get("created_at"),
+        })
+
+    return jsonify({"data": formatted, "meta": {"total": len(formatted)}})
+
+
+# ---------------------------------------------------------------------------
+# POST /api/students/offers/<offer_id>/respond
+# ---------------------------------------------------------------------------
+
+@students_bp.post("/offers/<string:offer_id>/respond")
+@require_auth
+def respond_to_offer(offer_id):
+    """Student accepts or rejects an offer."""
+    payload = request.get_json(silent=True) or {}
+    decision = payload.get("decision")
+    note = payload.get("note", "")
+
+    if decision not in ("accepted", "rejected"):
+        return _err("VALIDATION_ERROR", "'decision' must be 'accepted' or 'rejected'", 400)
+
+    # Fetch offer
+    try:
+        offer_res = (
+            supabase.table("offers")
+            .select("id, student_id, job_id, application_id, company_id, status")
+            .eq("id", offer_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Offer not found", 404)
+
+    if not offer_res.data:
+        return _err("NOT_FOUND", "Offer not found", 404)
+
+    if offer_res.data.get("student_id") != g.user_id:
+        return _err("FORBIDDEN", "Not your offer", 403)
+
+    if offer_res.data.get("status") != "sent":
+        return _err("INVALID_TRANSITION", "Can only respond to 'sent' offers", 422)
+
+    now = datetime.utcnow().isoformat()
+
+    # Update offer
+    try:
+        supabase.table("offers").update({
+            "status": decision,
+            "responded_at": now,
+            "rejection_reason": note if decision == "rejected" else None,
+        }).eq("id", offer_id).execute()
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to update offer", 500)
+
+    # Update application status
+    app_status = "accepted" if decision == "accepted" else "rejected"
+    try:
+        supabase.table("applications").update({
+            "status": app_status,
+        }).eq("id", offer_res.data.get("application_id")).execute()
+    except Exception:
+        pass
+
+    # If accepted, create internship record
+    if decision == "accepted":
+        offer_details = {}
+        try:
+            full_offer = (
+                supabase.table("offers")
+                .select("offer_details")
+                .eq("id", offer_id)
+                .single()
+                .execute()
+            )
+            offer_details = (full_offer.data or {}).get("offer_details", {})
+        except Exception:
+            pass
+
+        start_date = offer_details.get("start_date", datetime.utcnow().strftime("%Y-%m-%d"))
+        end_date = offer_details.get("end_date", "2026-12-31")
+
+        try:
+            supabase.table("internships").insert({
+                "application_id": offer_res.data.get("application_id"),
+                "student_id": g.user_id,
+                "job_id": offer_res.data.get("job_id"),
+                "company_id": offer_res.data.get("company_id"),
+                "status": "pre_boarding",
+                "start_date": start_date,
+                "end_date": end_date,
+            }).execute()
+        except Exception:
+            pass
+
+    # Notify platform admin
+    notify_admins(
+        "offer_accepted" if decision == "accepted" else "offer_rejected",
+        f"Offer {decision}",
+        f"Student has {decision} the internship offer.",
+        "job", offer_res.data.get("job_id"),
+    )
+
+    return jsonify({
+        "data": {"id": offer_id, "status": decision},
+    })
