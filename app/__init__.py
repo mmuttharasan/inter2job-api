@@ -16,6 +16,7 @@ def create_app(config=None):
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:8000",
+        "https://intern2job-frontend.vercel.app",
     ]
     frontend_url = os.environ.get("FRONTEND_URL")
     if frontend_url:
