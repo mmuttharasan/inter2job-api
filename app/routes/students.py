@@ -986,16 +986,29 @@ def get_my_interviews():
         round_info = rounds_map.get(s.get("round_id"), {})
         job_info = jobs_map.get(round_info.get("job_id"), {})
         company_info = companies_map.get(job_info.get("company_id"), {})
+
+        # Include proposed_slots when round is in slots_approved so student can pick
+        round_status = round_info.get("status", "")
+        proposed_slots = (
+            round_info.get("proposed_slots", [])
+            if round_status == "slots_approved"
+            else []
+        )
+
         formatted.append({
             "id": s["id"],
             "round_id": s.get("round_id"),
             "application_id": s.get("application_id"),
             "scheduled_slot": s.get("scheduled_slot"),
+            "student_selected_slot": s.get("student_selected_slot"),
+            "slot_selected_at": s.get("slot_selected_at"),
             "result": s.get("result", "pending"),
             "result_note": s.get("result_note"),
             "created_at": s.get("created_at"),
             "round_number": round_info.get("round_number"),
-            "round_status": round_info.get("round_status", round_info.get("status")),
+            "round_status": round_info.get("round_status", round_status),
+            "proposed_slots": proposed_slots,
+            "company_slot_note": round_info.get("company_slot_note"),
             "job_id": round_info.get("job_id"),
             "job_title": job_info.get("title"),
             "job_location": job_info.get("location"),
@@ -1006,3 +1019,80 @@ def get_my_interviews():
         })
 
     return jsonify({"data": formatted, "meta": {"total": len(formatted)}})
+
+
+# ---------------------------------------------------------------------------
+# POST /api/students/interviews/<schedule_id>/select-slot
+# ---------------------------------------------------------------------------
+
+@students_bp.post("/interviews/<schedule_id>/select-slot")
+@require_auth
+def select_interview_slot(schedule_id):
+    """Student selects a preferred interview slot from the proposed slots."""
+    payload = request.get_json(silent=True) or {}
+    selected_slot = payload.get("slot")
+    if not selected_slot or not isinstance(selected_slot, dict):
+        return _err("VALIDATION_ERROR", "'slot' must be a non-empty object with date/time", 400)
+
+    # Verify this schedule belongs to the student
+    try:
+        sched_res = (
+            supabase.table("interview_schedules")
+            .select("id, student_id, round_id, student_selected_slot")
+            .eq("id", schedule_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Interview schedule not found", 404)
+
+    if not sched_res.data:
+        return _err("NOT_FOUND", "Interview schedule not found", 404)
+
+    sched = sched_res.data
+    if sched["student_id"] != g.user_id:
+        return _err("FORBIDDEN", "You can only select slots for your own interviews", 403)
+
+    if sched.get("student_selected_slot"):
+        return _err("ALREADY_SELECTED", "You have already selected a slot for this interview", 400)
+
+    # Verify the round is in slots_approved status
+    try:
+        round_res = (
+            supabase.table("interview_rounds")
+            .select("id, status, proposed_slots")
+            .eq("id", sched["round_id"])
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Interview round not found", 404)
+
+    if not round_res.data or round_res.data["status"] != "slots_approved":
+        return _err(
+            "INVALID_STATUS",
+            "Slot selection is not available at this time",
+            400,
+        )
+
+    # Update the schedule with the student's selected slot
+    try:
+        supabase.table("interview_schedules").update({
+            "student_selected_slot": selected_slot,
+            "slot_selected_at": datetime.utcnow().isoformat(),
+        }).eq("id", schedule_id).execute()
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to save slot selection", 500)
+    notify_admins(
+        "student_slot_selected",
+        "Student selected interview slot",
+        "A student has selected their preferred interview slot.",
+        "interview_schedule", schedule_id,
+    )
+
+    return jsonify({
+        "data": {
+            "id": schedule_id,
+            "student_selected_slot": selected_slot,
+        },
+    })

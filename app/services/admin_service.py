@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 from urllib.error import URLError
-from ..services.supabase_client import supabase
+from ..services.supabase_client import supabase, supabase_admin
 from ..services.email_service import send_company_admin_welcome
 
 
@@ -216,7 +216,7 @@ def create_user_admin(actor_id: str, data: dict) -> dict:
 
     # Create auth user (service-role skips email confirmation)
     try:
-        response = supabase.auth.admin.create_user({
+        response = supabase_admin.auth.admin.create_user({
             "email": email,
             "password": password,
             "email_confirm": True,
@@ -627,7 +627,7 @@ def register_company_with_admin(actor_id: str, data: dict) -> dict:
 
     # 3. Create Supabase auth user
     try:
-        response = supabase.auth.admin.create_user({
+        response = supabase_admin.auth.admin.create_user({
             "email": admin_email,
             "password": temp_password,
             "email_confirm": True,
@@ -826,7 +826,7 @@ def create_university(actor_id: str, data: dict) -> dict:
 
     # 1. Create the university_admin auth user
     try:
-        response = supabase.auth.admin.create_user({
+        response = supabase_admin.auth.admin.create_user({
             "email": admin_email,
             "password": admin_password,
             "email_confirm": True,
@@ -1701,7 +1701,7 @@ def create_university_student(university_id: str, actor_id: str, data: dict) -> 
 
     # 1. Create Supabase auth user
     try:
-        response = supabase.auth.admin.create_user({
+        response = supabase_admin.auth.admin.create_user({
             "email": email,
             "password": password,
             "email_confirm": True,

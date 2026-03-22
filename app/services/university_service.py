@@ -10,7 +10,7 @@ import string
 import uuid
 from datetime import datetime, timezone
 
-from ..services.supabase_client import supabase
+from ..services.supabase_client import supabase, supabase_admin
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -225,7 +225,7 @@ def create_student(university_id: str, actor_id: str, data: dict) -> dict:
 
     # 1. Create Supabase auth user
     try:
-        response = supabase.auth.admin.create_user({
+        response = supabase_admin.auth.admin.create_user({
             "email": email,
             "password": password,
             "email_confirm": True,

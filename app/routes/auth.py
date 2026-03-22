@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from ..services.supabase_client import supabase
+from ..services.supabase_client import supabase, _make_auth_client
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -29,7 +29,8 @@ def login():
         return jsonify({"error": "Email and password are required"}), 400
 
     try:
-        response = supabase.auth.sign_in_with_password(
+        auth_client = _make_auth_client()
+        response = auth_client.auth.sign_in_with_password(
             {"email": email, "password": password}
         )
         user = response.user
@@ -70,7 +71,8 @@ def signup():
         role = "student"
 
     try:
-        response = supabase.auth.sign_up(
+        auth_client = _make_auth_client()
+        response = auth_client.auth.sign_up(
             {
                 "email": email,
                 "password": password,
@@ -122,7 +124,7 @@ def signup():
 @auth_bp.route("/logout", methods=["POST"])
 def logout():
     try:
-        supabase.auth.sign_out()
+        _make_auth_client().auth.sign_out()
     except Exception:
         pass
     return jsonify({"message": "Logged out successfully"})

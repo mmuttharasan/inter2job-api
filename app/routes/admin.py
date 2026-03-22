@@ -28,7 +28,7 @@ Uses require_role(["admin"]) except for the public stats endpoint.
 
 from flask import Blueprint, jsonify, request, g
 from ..middleware.auth import require_role
-from ..services.supabase_client import supabase
+from ..services.supabase_client import supabase, supabase_admin
 from ..services.admin_service import (
     get_platform_stats,
     get_admin_dashboard,
@@ -813,7 +813,7 @@ def issued_certificates():
 # ═══════════════════════════════════════════════════════════════════════════
 
 from datetime import datetime
-from ..services.supabase_client import supabase
+from ..services.supabase_client import supabase, supabase_admin
 from ..services.notification_service import (
     notify, notify_bulk, notify_admins,
     notify_university_admins_for_job, notify_company_admins_for_job,
@@ -1534,6 +1534,100 @@ def forward_to_company(job_id):
     })
 
 
+@admin_bp.post("/jobs/<job_id>/approve-slots")
+@require_role(["admin"])
+def approve_interview_slots(job_id):
+    """Platform admin approves company-submitted interview slots.
+
+    Once approved, the slots become visible to shortlisted students
+    who can then select their preferred slot.
+    """
+    # Find the latest interview round
+    try:
+        round_res = (
+            supabase.table("interview_rounds")
+            .select("id, status, proposed_slots")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch interview round", 500)
+
+    if not round_res.data:
+        return _err("NOT_FOUND", "No interview round found. Company must submit slots first.", 404)
+
+    rnd = round_res.data[0]
+    if rnd["status"] != "slots_submitted":
+        return _err(
+            "INVALID_STATUS",
+            f"Round is in '{rnd['status']}' status — only 'slots_submitted' rounds can be approved",
+            400,
+        )
+
+    # Update round status to slots_approved
+    try:
+        supabase.table("interview_rounds").update({
+            "status": "slots_approved",
+        }).eq("id", rnd["id"]).execute()
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to approve slots", 500)
+
+    # Create interview_schedule rows for all shortlisted candidates
+    # (so they can see the round and select a slot)
+    try:
+        apps_res = (
+            supabase.table("applications")
+            .select("id, student_id")
+            .eq("job_id", job_id)
+            .eq("status", "shortlisted")
+            .execute()
+        )
+    except Exception:
+        apps_res = type("R", (), {"data": []})()
+
+    created = 0
+    student_ids = []
+    for app in (apps_res.data or []):
+        try:
+            supabase.table("interview_schedules").insert({
+                "round_id": rnd["id"],
+                "application_id": app["id"],
+                "student_id": app["student_id"],
+                "scheduled_slot": None,
+                "student_selected_slot": None,
+            }).execute()
+            created += 1
+            student_ids.append(app["student_id"])
+        except Exception:
+            pass
+
+    # Notify students that slots are available to select
+    if student_ids:
+        notify_bulk(
+            student_ids, "interview_slots_available",
+            "Interview slots available",
+            "Interview time slots are now available. Please select your preferred slot.",
+            "job", job_id,
+        )
+
+    # Notify company that slots were approved
+    notify_company_admins_for_job(
+        job_id, "slots_approved",
+        "Interview slots approved",
+        "Your proposed interview slots have been approved by the platform admin.",
+    )
+
+    return jsonify({
+        "data": {
+            "approved": True,
+            "candidates_notified": created,
+            "proposed_slots": rnd.get("proposed_slots", []),
+        },
+    })
+
+
 @admin_bp.post("/jobs/<job_id>/schedule-interviews")
 @require_role(["admin"])
 def schedule_interviews(job_id):
@@ -1931,7 +2025,7 @@ def get_admin_student_profile(student_id: str):
     # Get email from auth.users via admin API
     user_email = None
     try:
-        user_resp = supabase.auth.admin.get_user_by_id(student_id)
+        user_resp = supabase_admin.auth.admin.get_user_by_id(student_id)
         if user_resp and user_resp.user:
             user_email = user_resp.user.email
     except Exception:
