@@ -1682,13 +1682,19 @@ def submit_interview_results(job_id):
             app_id = r.get("application_id")
             student_id = r.get("student_id")
             if app_id and student_id:
+                # Build offer_details with offer_type and expected_start_date
+                offer_details = r.get("offer_details", {})
+                if r.get("offer_type"):
+                    offer_details["offer_type"] = r["offer_type"]
+                if r.get("expected_start_date"):
+                    offer_details["expected_start_date"] = r["expected_start_date"]
                 try:
                     offer_res = supabase.table("offers").insert({
                         "job_id": job_id,
                         "application_id": app_id,
                         "student_id": student_id,
                         "company_id": company_id,
-                        "offer_details": r.get("offer_details", {}),
+                        "offer_details": offer_details,
                         "status": "pending",
                         "response_deadline": r.get("response_deadline"),
                     }).execute()

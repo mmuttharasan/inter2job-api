@@ -28,6 +28,7 @@ Uses require_role(["admin"]) except for the public stats endpoint.
 
 from flask import Blueprint, jsonify, request, g
 from ..middleware.auth import require_role
+from ..services.supabase_client import supabase
 from ..services.admin_service import (
     get_platform_stats,
     get_admin_dashboard,
@@ -1900,4 +1901,344 @@ def send_offers(job_id):
 
     return jsonify({
         "data": {"sent": sent_count, "lifecycle_stage": "offer_stage"},
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/students/<student_id>/profile
+# Full student profile for Platform Admin — includes evaluations,
+# certificates, internships, and application history.
+# ---------------------------------------------------------------------------
+
+@admin_bp.get("/students/<string:student_id>/profile")
+@require_role(["admin", "super_admin"])
+def get_admin_student_profile(student_id: str):
+    def _err(code, msg, status):
+        return jsonify({"error": {"code": code, "message": msg}}), status
+
+    # 1. Profile + student row
+    profile_data = {}
+    try:
+        pr = supabase.table("profiles").select(
+            "id, full_name, avatar_url, role"
+        ).eq("id", student_id).maybe_single().execute()
+        if not pr.data:
+            return _err("NOT_FOUND", "Student not found", 404)
+        profile_data = pr.data
+    except Exception:
+        return _err("NOT_FOUND", "Student not found", 404)
+
+    # Get email from auth.users via admin API
+    user_email = None
+    try:
+        user_resp = supabase.auth.admin.get_user_by_id(student_id)
+        if user_resp and user_resp.user:
+            user_email = user_resp.user.email
+    except Exception:
+        pass
+
+    student_data = {}
+    try:
+        sr = supabase.table("students").select("*").eq("id", student_id).maybe_single().execute()
+        if sr.data:
+            student_data = sr.data
+    except Exception:
+        pass
+
+    # University name
+    university_name = None
+    if student_data.get("university_id"):
+        try:
+            ur = supabase.table("universities").select("name").eq(
+                "id", student_data["university_id"]
+            ).maybe_single().execute()
+            if ur.data:
+                university_name = ur.data.get("name")
+        except Exception:
+            pass
+
+    # 2. Evaluation sessions + scores
+    evaluations = []
+    try:
+        ev_res = supabase.table("evaluation_sessions").select(
+            "id, job_id, interview_type, status, recommendation, "
+            "total_score, max_score, overall_notes, created_at, updated_at"
+        ).eq("student_id", student_id).order("created_at", desc=True).execute()
+
+        for ev in (ev_res.data or []):
+            # Job title
+            job_title = None
+            try:
+                jr = supabase.table("jobs").select("title, department").eq(
+                    "id", ev["job_id"]
+                ).maybe_single().execute()
+                if jr.data:
+                    job_title = jr.data.get("title")
+            except Exception:
+                pass
+
+            # Scores by dimension
+            scores_by_dimension = {}
+            try:
+                sc_res = supabase.table("evaluation_scores").select(
+                    "score, max_score, dimension, notes"
+                ).eq("session_id", ev["id"]).execute()
+                for sc in (sc_res.data or []):
+                    dim = sc.get("dimension", "technical")
+                    if dim not in scores_by_dimension:
+                        scores_by_dimension[dim] = {"total": 0, "max_total": 0, "count": 0}
+                    scores_by_dimension[dim]["total"] += sc.get("score", 0)
+                    scores_by_dimension[dim]["max_total"] += sc.get("max_score", 5)
+                    scores_by_dimension[dim]["count"] += 1
+            except Exception:
+                pass
+
+            dimension_scores = {}
+            for dim, vals in scores_by_dimension.items():
+                pct = round((vals["total"] / vals["max_total"]) * 100) if vals["max_total"] else 0
+                dimension_scores[dim] = pct
+
+            overall_pct = round((ev.get("total_score", 0) / ev.get("max_score", 1)) * 100) if ev.get("max_score") else 0
+
+            evaluations.append({
+                "session_id": ev["id"],
+                "job_title": job_title,
+                "interview_type": ev.get("interview_type"),
+                "status": ev.get("status"),
+                "recommendation": ev.get("recommendation"),
+                "overall_score": overall_pct,
+                "dimension_scores": dimension_scores,
+                "overall_notes": ev.get("overall_notes"),
+                "created_at": ev.get("created_at"),
+            })
+    except Exception:
+        pass
+
+    # 3. Certificates
+    certificates = []
+    try:
+        cert_res = supabase.table("certificates").select(
+            "id, student_name, company_name, job_title, start_date, end_date, "
+            "skills_demonstrated, performance_summary, mentor_name, "
+            "verification_code, issued_at"
+        ).eq("student_id", student_id).order("issued_at", desc=True).execute()
+        certificates = cert_res.data or []
+    except Exception:
+        pass
+
+    # 4. Internships
+    internships = []
+    try:
+        intern_res = supabase.table("internships").select(
+            "id, job_id, company_id, status, start_date, end_date, "
+            "mentor_name, team, conclusion_type, conclusion_note, concluded_at"
+        ).eq("student_id", student_id).order("start_date", desc=True).execute()
+
+        for intern in (intern_res.data or []):
+            # Get company name + job title
+            company_name = None
+            job_title = None
+            try:
+                if intern.get("company_id"):
+                    cr = supabase.table("companies").select("name").eq(
+                        "id", intern["company_id"]
+                    ).maybe_single().execute()
+                    if cr.data:
+                        company_name = cr.data.get("name")
+            except Exception:
+                pass
+            try:
+                if intern.get("job_id"):
+                    jr = supabase.table("jobs").select("title").eq(
+                        "id", intern["job_id"]
+                    ).maybe_single().execute()
+                    if jr.data:
+                        job_title = jr.data.get("title")
+            except Exception:
+                pass
+
+            internships.append({
+                **intern,
+                "company_name": company_name,
+                "job_title": job_title,
+            })
+    except Exception:
+        pass
+
+    # 5. Applications history
+    applications = []
+    try:
+        apps_res = supabase.table("applications").select(
+            "id, job_id, status, ai_score, created_at"
+        ).eq("student_id", student_id).order("created_at", desc=True).execute()
+
+        for app in (apps_res.data or []):
+            job_title = None
+            company_name = None
+            try:
+                jr = supabase.table("jobs").select(
+                    "title, companies(name)"
+                ).eq("id", app["job_id"]).maybe_single().execute()
+                if jr.data:
+                    job_title = jr.data.get("title")
+                    co = jr.data.get("companies")
+                    if isinstance(co, dict):
+                        company_name = co.get("name")
+            except Exception:
+                pass
+            applications.append({
+                **app,
+                "job_title": job_title,
+                "company_name": company_name,
+            })
+    except Exception:
+        pass
+
+    # Build skills with levels from student record
+    skills_raw = student_data.get("skills") or []
+    skills = [{"name": s, "level": 0, "verified": False} for s in skills_raw]
+
+    return jsonify({
+        "data": {
+            "id": student_id,
+            "name": profile_data.get("full_name"),
+            "email": user_email,
+            "avatar_url": profile_data.get("avatar_url"),
+            "school": university_name,
+            "department": student_data.get("department"),
+            "graduation_year": student_data.get("graduation_year"),
+            "gpa": student_data.get("gpa"),
+            "bio": student_data.get("bio"),
+            "jp_level": student_data.get("jp_level"),
+            "location": student_data.get("location"),
+            "phone": student_data.get("phone"),
+            "linkedin": student_data.get("linkedin"),
+            "github": student_data.get("github"),
+            "portfolio": student_data.get("portfolio"),
+            "skills": skills,
+            "strengths": student_data.get("strengths") or [],
+            "awards": student_data.get("awards") or [],
+            "experiences": student_data.get("experiences") or [],
+            "research_title": student_data.get("research_title"),
+            "badges": student_data.get("badges") or [],
+            "resume_url": student_data.get("resume_url"),
+            "verification_status": student_data.get("verification_status", "unverified"),
+            "profile_completeness": float(student_data.get("profile_completeness") or 0),
+            # Admin-specific data
+            "evaluations": evaluations,
+            "certificates": certificates,
+            "internships": internships,
+            "applications": applications,
+        }
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/students/<student_id>/ai-analysis
+# Uses Claude to analyse a student against a specific JD and produce
+# Analytical score, Cultural Fitment score, and recommendations.
+# ---------------------------------------------------------------------------
+
+@admin_bp.post("/students/<string:student_id>/ai-analysis")
+@require_role(["admin", "super_admin"])
+def admin_student_ai_analysis(student_id: str):
+    def _err(code, msg, status):
+        return jsonify({"error": {"code": code, "message": msg}}), status
+
+    data = request.get_json(silent=True) or {}
+    job_id = data.get("job_id")
+    if not job_id:
+        return _err("VALIDATION_ERROR", "job_id is required", 400)
+
+    # Fetch job
+    job_data = {}
+    try:
+        jr = supabase.table("jobs").select(
+            "id, title, department, description, skills, "
+            "responsibilities, qualifications, required_language, "
+            "experience_level, employment_type, location"
+        ).eq("id", job_id).maybe_single().execute()
+        if not jr.data:
+            return _err("NOT_FOUND", "Job not found", 404)
+        job_data = jr.data
+    except Exception:
+        return _err("NOT_FOUND", "Job not found", 404)
+
+    # Fetch student
+    student_data = {}
+    try:
+        sr = supabase.table("students").select("*").eq("id", student_id).maybe_single().execute()
+        if sr.data:
+            student_data = sr.data
+    except Exception:
+        pass
+
+    # Fetch profile
+    profile_name = "Unknown"
+    try:
+        pr = supabase.table("profiles").select("full_name").eq("id", student_id).maybe_single().execute()
+        if pr.data:
+            profile_name = pr.data.get("full_name", "Unknown")
+    except Exception:
+        pass
+
+    # University name
+    university_name = "Unknown"
+    if student_data.get("university_id"):
+        try:
+            ur = supabase.table("universities").select("name").eq(
+                "id", student_data["university_id"]
+            ).maybe_single().execute()
+            if ur.data:
+                university_name = ur.data.get("name", "Unknown")
+        except Exception:
+            pass
+
+    # Build student dict for LLM
+    student_for_llm = {
+        "name": profile_name,
+        "university_name": university_name,
+        "department": student_data.get("department"),
+        "gpa": str(student_data.get("gpa") or "N/A"),
+        "skills": student_data.get("skills") or [],
+        "jp_level": student_data.get("jp_level"),
+        "research_title": student_data.get("research_title"),
+        "graduation_year": student_data.get("graduation_year"),
+        "bio": student_data.get("bio"),
+        "strengths": student_data.get("strengths") or [],
+        "experiences": student_data.get("experiences") or [],
+        "awards": student_data.get("awards") or [],
+    }
+
+    # Check for existing AI match score
+    scores = {"total": 0, "skill_match": 0, "research_sim": 0, "lang_readiness": 0, "learning_traj": 0}
+    try:
+        # Look for application ai_score
+        app_res = supabase.table("applications").select(
+            "ai_score"
+        ).eq("student_id", student_id).eq("job_id", job_id).maybe_single().execute()
+        if app_res.data and app_res.data.get("ai_score"):
+            scores["total"] = int(app_res.data["ai_score"])
+    except Exception:
+        pass
+
+    # Call Claude LLM
+    try:
+        from ..services.llm_service import LLMService
+        svc = LLMService("claude")
+        analysis = svc.analyze_one(job_data, student_for_llm, scores)
+        if not analysis:
+            return _err("LLM_ERROR", "AI analysis failed — no response", 500)
+    except ValueError as ve:
+        return _err("CONFIG_ERROR", str(ve), 500)
+    except Exception as exc:
+        return _err("LLM_ERROR", f"AI analysis failed: {exc}", 500)
+
+    return jsonify({
+        "data": {
+            "student_id": student_id,
+            "job_id": job_id,
+            "job_title": job_data.get("title"),
+            "analysis": analysis,
+        }
     })

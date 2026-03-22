@@ -468,3 +468,108 @@ def list_university_student_applications(job_id):
         })
 
     return jsonify({"data": formatted, "meta": {"total": len(formatted)}})
+
+
+# ---------------------------------------------------------------------------
+# GET /me/assigned-jobs/<job_id>/interview-schedules
+# ---------------------------------------------------------------------------
+
+@jd_workflow_bp.get("/me/assigned-jobs/<string:job_id>/interview-schedules")
+@require_role(["university_admin"])
+def get_job_interview_schedules(job_id):
+    """Get interview schedules for a job's students from this university."""
+    university_id, err = _get_university_id(g.user_id)
+    if err:
+        return err
+
+    # Verify assignment
+    try:
+        assign_res = (
+            supabase.table("job_university_assignments")
+            .select("id")
+            .eq("job_id", job_id)
+            .eq("university_id", university_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return _err("NOT_FOUND", "Job not assigned to your university", 404)
+
+    if not assign_res.data:
+        return _err("NOT_FOUND", "Job not assigned to your university", 404)
+
+    # Get all students at this university
+    try:
+        students_res = (
+            supabase.table("students")
+            .select("id")
+            .eq("university_id", university_id)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch students", 500)
+
+    student_ids = [s["id"] for s in (students_res.data or [])]
+    if not student_ids:
+        return jsonify({"data": {"rounds": [], "schedules": []}, "meta": {"total": 0}})
+
+    # Fetch interview rounds for this job
+    try:
+        rounds_res = (
+            supabase.table("interview_rounds")
+            .select("*")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return jsonify({"data": {"rounds": [], "schedules": []}, "meta": {"total": 0}})
+
+    rounds = rounds_res.data or []
+    round_ids = [r["id"] for r in rounds]
+
+    if not round_ids:
+        return jsonify({"data": {"rounds": rounds, "schedules": []}, "meta": {"total": 0}})
+
+    # Fetch schedules only for this university's students
+    try:
+        sched_res = (
+            supabase.table("interview_schedules")
+            .select("*")
+            .in_("round_id", round_ids)
+            .in_("student_id", student_ids)
+            .order("created_at", desc=False)
+            .execute()
+        )
+    except Exception:
+        return jsonify({"data": {"rounds": rounds, "schedules": []}, "meta": {"total": 0}})
+
+    schedules = sched_res.data or []
+
+    # Enrich with student names
+    sched_student_ids = list({s["student_id"] for s in schedules})
+    names_map = {}
+    if sched_student_ids:
+        try:
+            profiles_res = (
+                supabase.table("profiles")
+                .select("id, full_name")
+                .in_("id", sched_student_ids)
+                .execute()
+            )
+            for p in (profiles_res.data or []):
+                names_map[p["id"]] = p.get("full_name")
+        except Exception:
+            pass
+
+    formatted_schedules = []
+    for s in schedules:
+        formatted_schedules.append({
+            **s,
+            "student_name": names_map.get(s["student_id"]),
+        })
+
+    return jsonify({
+        "data": {"rounds": rounds, "schedules": formatted_schedules},
+        "meta": {"total": len(formatted_schedules)},
+    })

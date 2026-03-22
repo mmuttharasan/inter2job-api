@@ -910,3 +910,99 @@ def respond_to_offer(offer_id):
     return jsonify({
         "data": {"id": offer_id, "status": decision},
     })
+
+
+# ---------------------------------------------------------------------------
+# GET /api/students/my-interviews
+# ---------------------------------------------------------------------------
+
+@students_bp.get("/my-interviews")
+@require_auth
+def get_my_interviews():
+    """Get all interview schedules for the authenticated student."""
+    try:
+        sched_res = (
+            supabase.table("interview_schedules")
+            .select("*")
+            .eq("student_id", g.user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return _err("SERVER_ERROR", "Failed to fetch interview schedules", 500)
+
+    schedules = sched_res.data or []
+    if not schedules:
+        return jsonify({"data": [], "meta": {"total": 0}})
+
+    # Gather round_ids to fetch round info
+    round_ids = list({s["round_id"] for s in schedules})
+    rounds_map = {}
+    try:
+        rounds_res = (
+            supabase.table("interview_rounds")
+            .select("id, job_id, round_number, status, proposed_slots")
+            .in_("id", round_ids)
+            .execute()
+        )
+        for r in (rounds_res.data or []):
+            rounds_map[r["id"]] = r
+    except Exception:
+        pass
+
+    # Gather job_ids to fetch job + company info
+    job_ids = list({r.get("job_id") for r in rounds_map.values() if r.get("job_id")})
+    jobs_map = {}
+    if job_ids:
+        try:
+            jobs_res = (
+                supabase.table("jobs")
+                .select("id, title, company_id, location, lifecycle_stage, deadline")
+                .in_("id", job_ids)
+                .execute()
+            )
+            for j in (jobs_res.data or []):
+                jobs_map[j["id"]] = j
+        except Exception:
+            pass
+
+    company_ids = list({j.get("company_id") for j in jobs_map.values() if j.get("company_id")})
+    companies_map = {}
+    if company_ids:
+        try:
+            comp_res = (
+                supabase.table("companies")
+                .select("id, name, logo_url")
+                .in_("id", company_ids)
+                .execute()
+            )
+            for c in (comp_res.data or []):
+                companies_map[c["id"]] = c
+        except Exception:
+            pass
+
+    formatted = []
+    for s in schedules:
+        round_info = rounds_map.get(s.get("round_id"), {})
+        job_info = jobs_map.get(round_info.get("job_id"), {})
+        company_info = companies_map.get(job_info.get("company_id"), {})
+        formatted.append({
+            "id": s["id"],
+            "round_id": s.get("round_id"),
+            "application_id": s.get("application_id"),
+            "scheduled_slot": s.get("scheduled_slot"),
+            "result": s.get("result", "pending"),
+            "result_note": s.get("result_note"),
+            "created_at": s.get("created_at"),
+            "round_number": round_info.get("round_number"),
+            "round_status": round_info.get("round_status", round_info.get("status")),
+            "job_id": round_info.get("job_id"),
+            "job_title": job_info.get("title"),
+            "job_location": job_info.get("location"),
+            "job_lifecycle_stage": job_info.get("lifecycle_stage"),
+            "job_deadline": job_info.get("deadline"),
+            "company_name": company_info.get("name"),
+            "company_logo_url": company_info.get("logo_url"),
+        })
+
+    return jsonify({"data": formatted, "meta": {"total": len(formatted)}})
